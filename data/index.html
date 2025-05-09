@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Smart Locker Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+
+  <!-- Firebase SDKs (compat) -->
+  <script src="https://www.gstatic.com/firebasejs/9.6.10/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.6.10/firebase-database-compat.js"></script>
+  
+  <!-- Your own config: copy firebaseConfig.js.example → firebaseConfig.js -->
+  <script src="firebaseConfig.js"></script>
+  <script defer src="script.js"></script>
+</head>
+<body>
+  <h1>Smart Locker Dashboard</h1>
+
+  <div class="tabs">
+    <button id="statusTab" class="active">Status</button>
+    <button id="controlTab">Control</button>
+    <button id="logsTab">Logs</button>
+  </div>
+
+  <!-- STATUS PAGE -->
+  <div id="statusPage" class="page">
+    <h2>Locker Status</h2>
+    <p id="locker-status">Checking…</p>
+  </div>
+
+  <!-- CONTROL PAGE -->
+  <div id="controlPage" class="page" style="display:none;">
+    <h2>Control Locker</h2>
+    <input type="password" id="pwd" placeholder="Enter password" />
+    <button onclick="doControl('lock')">Lock</button>
+    <button onclick="doControl('unlock')">Unlock</button>
+
+    <hr />
+
+    <h3>Change Admin Password</h3>
+    <input type="password" id="newPwd" placeholder="New password" />
+    <button onclick="setPassword()">Set Password</button>
+    <p id="action-result"></p>
+  </div>
+
+  <!-- LOGS PAGE -->
+  <div id="logsPage" class="page" style="display:none;">
+    <h2>Locker Logs</h2>
+    <label for="logFilter">Filter by Method:</label>
+    <select id="logFilter">
+      <option value="All">All</option>
+      <option value="WEB">WEB</option>
+      <option value="RFID">RFID</option>
+    </select>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Method</th>
+          <th>Action</th>
+          <th>Success</th>
+          <th>Message</th>
+        </tr>
+      </thead>
+      <tbody id="logsTable">
+        <!-- Populated by script.js -->
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>

@@ -1,0 +1,308 @@
+/**
+ * Smart IoT Locker System example
+ * --------------------------------
+ * ESP32 sketch demonstrating:
+ *  - Dual authentication (RFID for users, web‑based password for admin)
+ *  - Firebase logging of all events with timestamps
+ *  - SPIFFS‑served web dashboard for control, status, and logs
+ *
+ * **IMPORTANT:**  
+ *   • Do NOT check your real secrets.h into GitHub—keep it local!  
+ *   • Rename secrets.example.h → secrets.h and populate your own values.
+ */
+
+ #include <WiFi.h>
+ #include <WebServer.h>
+ #include <SPIFFS.h>
+ #include <SPI.h>
+ #include <MFRC522.h>
+ #include <Wire.h>
+ #include <LiquidCrystal_I2C.h>
+ #include <FirebaseESP32.h>
+ #include <time.h>
+ #include "secrets.h"            // Local file: define WIFI_SSID, WIFI_PASSWORD, etc.
+ 
+ //
+ // === CONSTANTS & PINS ===
+ //
+ 
+ // Firebase paths
+ #define LOG_PATH_WEB       "/locker/logs/web"
+ #define LOG_PATH_RFID      "/locker/logs/rfid"
+ #define FIREBASE_PASSWORD_PATH "/locker/password/value"
+ 
+ // Hardware pin assignments
+ #define RELAY_PIN          4     // Controls the lock actuator
+ #define IR_SENSOR_PIN      2     // Detects if locker is empty/full
+ #define SS_PIN             5     // RFID SPI SS pin
+ #define RST_PIN            0     // RFID reset pin
+ 
+ // RFID reader and LCD display
+ LiquidCrystal_I2C lcd(0x27, 16, 2);
+ MFRC522        mfrc522(SS_PIN, RST_PIN);
+ WebServer      server(80);
+ 
+ // Firebase objects
+ FirebaseData   fbdo;
+ FirebaseAuth   auth;
+ FirebaseConfig config;
+ 
+ // State variables
+ String unlockPassword = "";   // Loaded from Firebase on boot
+ bool   isLocked       = true; // Current lock state
+ 
+ //
+ // === UTILITY: Serve SPIFFS files ===
+ //
+ void serveFile(const char* path, const char* type) {
+   File file = SPIFFS.open(path, "r");
+   if (!file) {
+     server.send(404, "text/plain", "404: File Not Found");
+     return;
+   }
+   server.streamFile(file, type);
+   file.close();
+ }
+ 
+ //
+ // === HTTP HANDLERS ===
+ //
+ 
+ // Serve dashboard UI
+ void handleRoot()           { serveFile("/index.html",       "text/html"); }
+ void handleCSS()            { serveFile("/style.css",        "text/css"); }
+ void handleJS()             { serveFile("/script.js",        "application/javascript"); }
+ void handleFirebaseConfig() { serveFile("/firebaseConfig.js","application/javascript"); }
+ 
+ // Handle lock/unlock requests from web dashboard
+ void handleControl() {
+   if (!server.hasArg("state") || !server.hasArg("pwd")) {
+     server.send(400, "text/plain", "Bad Request");
+     return;
+   }
+   String state      = server.arg("state");
+   String enteredPwd = server.arg("pwd");
+   bool   success    = false;
+   String resultMsg;
+ 
+   // Check admin password
+   if (enteredPwd == unlockPassword) {
+     if (state == "unlock") {
+       digitalWrite(RELAY_PIN, LOW);
+       isLocked = false;
+       resultMsg = "Unlocked 🔓";
+       success   = true;
+     }
+     else if (state == "lock") {
+       // Only lock if the locker is empty (IR sensor LOW)
+       if (digitalRead(IR_SENSOR_PIN) == LOW) {
+         digitalWrite(RELAY_PIN, HIGH);
+         isLocked = true;
+         resultMsg = "Locked 🔒";
+         success   = true;
+       } else {
+         resultMsg = "Locker not empty!";
+       }
+     }
+     else {
+       resultMsg = "Unknown action";
+     }
+   }
+   else {
+     resultMsg = "Incorrect password!";
+   }
+ 
+   server.send(200, "text/plain", resultMsg);
+ 
+   // Log the web event to Firebase
+   time_t now = time(nullptr);
+   struct tm *t = localtime(&now);
+   char timeStr[32];
+   strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", t);
+ 
+   FirebaseJson logEntry;
+   logEntry.add("timestamp", timeStr);
+   logEntry.add("method",    "WEB");
+   logEntry.add("action",    state);
+   logEntry.add("success",   success ? "true" : "false");
+   logEntry.add("message",   resultMsg);
+ 
+   if (!Firebase.pushJSON(fbdo, LOG_PATH_WEB, logEntry)) {
+     Serial.println("WEB log failed: " + fbdo.errorReason());
+   }
+ }
+ 
+ // Handle admin password set/change via web
+ void handleSetPassword() {
+   if (!server.hasArg("pwd")) {
+     server.send(400, "text/plain", "Password not provided");
+     return;
+   }
+   String newPwd = server.arg("pwd");
+   if (Firebase.setString(fbdo, FIREBASE_PASSWORD_PATH, newPwd)) {
+     unlockPassword = newPwd;
+     server.send(200, "text/plain", "Password updated");
+   } else {
+     server.send(500, "text/plain", "Password update failed");
+   }
+ }
+ 
+ // Provide locker status (empty/full) as JSON
+ void handleStatus() {
+   bool empty = digitalRead(IR_SENSOR_PIN) == HIGH;
+   String payload = String("{\"empty\":") + (empty ? "true" : "false") + "}";
+   server.send(200, "application/json", payload);
+ }
+ 
+ //
+ // === SETUP ===
+ //
+ void setup() {
+   Serial.begin(115200);
+ 
+   // Initialize pins
+   pinMode(RELAY_PIN, OUTPUT);
+   pinMode(IR_SENSOR_PIN, INPUT);
+   digitalWrite(RELAY_PIN, HIGH); // Start locked
+ 
+   // Initialize LCD
+   lcd.init();
+   lcd.backlight();
+   lcd.setCursor(0,0);
+   lcd.print("Smart Locker");
+ 
+   // Initialize RFID reader
+   SPI.begin();
+   mfrc522.PCD_Init();
+   Serial.println("RFID ready");
+ 
+   // Connect to WiFi
+   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+   Serial.print("WiFi...");
+   while (WiFi.status() != WL_CONNECTED) {
+     delay(500);
+     Serial.print(".");
+   }
+   Serial.println("\nConnected: " + WiFi.localIP());
+ 
+   // Sync time (IST)
+   const long gmtOffset_sec    = 5 * 3600 + 30 * 60;
+   const int  daylightOffset  = 0;
+   configTime(gmtOffset_sec, daylightOffset, "pool.ntp.org");
+ 
+   // Mount SPIFFS
+   if (!SPIFFS.begin(true)) {
+     Serial.println("SPIFFS mount failed");
+   }
+ 
+   // Initialize Firebase
+   config.api_key        = FIREBASE_API_KEY;
+   config.database_url   = FIREBASE_DATABASE_URL;
+   auth.user.email       = FIREBASE_USER_EMAIL;
+   auth.user.password    = FIREBASE_USER_PASSWORD;
+   Firebase.begin(&config, &auth);
+   Firebase.reconnectWiFi(true);
+ 
+   // Load existing admin password
+   if (Firebase.getString(fbdo, FIREBASE_PASSWORD_PATH)) {
+     unlockPassword = fbdo.stringData();
+     Serial.println("Password loaded");
+   } else {
+     Serial.println("No password in DB");
+   }
+ 
+   // Register HTTP routes
+   server.on("/",           handleRoot);
+   server.on("/style.css",  handleCSS);
+   server.on("/script.js",  handleJS);
+   server.on("/firebaseConfig.js", handleFirebaseConfig);
+   server.on("/control",     handleControl);
+   server.on("/setPassword", handleSetPassword);
+   server.on("/status",      HTTP_GET, handleStatus);
+   server.begin();
+ 
+   lcd.clear();
+   lcd.setCursor(0,0);
+   lcd.print("Scan your card");
+ }
+ 
+ //
+ // === MAIN LOOP: RFID handling + auto‑lock ===
+ //
+ unsigned long unlockTime      = 0;
+ bool          autoLockPending = false;
+ 
+ void loop() {
+   server.handleClient();
+ 
+   // RFID scan processing
+   if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+     String uidStr;
+     for (byte i = 0; i < mfrc522.uid.size; i++) {
+       uidStr += String(mfrc522.uid.uidByte[i], HEX);
+     }
+ 
+     bool empty   = (digitalRead(IR_SENSOR_PIN) == LOW);
+     bool success = (uidStr == ADMIN_RFID_UID) && empty;
+ 
+     String resultMsg;
+     if (uidStr != String(ADMIN_RFID_UID)) {
+       resultMsg = "Access Denied";
+     } else if (!empty) {
+       resultMsg = "Locker not empty";
+     } else {
+       resultMsg = "Unlocked 🔓";
+       digitalWrite(RELAY_PIN, LOW);
+       isLocked = false;
+       unlockTime = millis();
+       autoLockPending = true;
+     }
+ 
+     // Log RFID event
+     time_t now = time(nullptr);
+     struct tm *t = localtime(&now);
+     char timeStr[32];
+     strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", t);
+ 
+     FirebaseJson logEntry;
+     logEntry.add("timestamp", timeStr);
+     logEntry.add("method",    "RFID");
+     logEntry.add("uid",       uidStr);
+     logEntry.add("action",    success ? "unlock" : "deny");
+     logEntry.add("success",   success ? "true" : "false");
+     logEntry.add("message",   resultMsg);
+     Firebase.pushJSON(fbdo, LOG_PATH_RFID, logEntry);
+ 
+     // Update LCD
+     lcd.clear();
+     lcd.setCursor(0,0);
+     lcd.print(resultMsg);
+     delay(3000);
+ 
+     // Reset RFID reader
+     mfrc522.PICC_HaltA();
+     mfrc522.PCD_StopCrypto1();
+ 
+     lcd.clear();
+     lcd.print("Scan your card");
+   }
+ 
+   // Auto‑lock after 5 seconds if unlocked
+   if (autoLockPending && millis() - unlockTime >= 5000) {
+     lcd.clear();
+     lcd.setCursor(0,0);
+     lcd.print("Auto‑locking...");
+     if (digitalRead(IR_SENSOR_PIN) == LOW) {
+       digitalWrite(RELAY_PIN, HIGH);
+       isLocked = true;
+       autoLockPending = false;
+       lcd.setCursor(0,1);
+       lcd.print("Locked 🔒");
+     } else {
+       lcd.setCursor(0,1);
+       lcd.print("Locker not empty");
+       unlockTime = millis();  // retry
+     }
+   }
+ }
+ 
